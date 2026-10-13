@@ -19,7 +19,6 @@ Security:
   - No credentials, no secrets, no mutation routes
 """
 
-import base64
 import os
 import re
 import secrets
@@ -28,7 +27,7 @@ import json
 from collections import defaultdict
 
 import requests
-from flask import Flask, Response, abort, jsonify, request
+from flask import Flask, Response, abort, request
 
 app = Flask(__name__)
 
@@ -84,7 +83,6 @@ def dashboard():
         f"<li><a href='{BASE}/list/flask'>/list/&lt;package&gt;</a> — list versions</li>"
         f"<li><a href='{BASE}/download/flask'>/download/&lt;package&gt;</a> — download latest wheel</li>"
         f"<li><a href='{BASE}/download/flask?version=3.1.2'>/download/&lt;package&gt;?version=X</a> — pinned</li>"
-        f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (for text-only fetchers)</li>"
         "</ul>"
         "<p>Only .whl files are served. Package names must match "
         "[A-Za-z0-9._-]+ (max 100 chars).</p>"
@@ -193,72 +191,6 @@ def download_wheel(pkg: str):
             "X-Version": wheel.get("version", "?"),
         },
     )
-
-
-@app.route(f"{BASE}/b64/<path:pkg>")
-def download_wheel_b64(pkg: str):
-    """Return the wheel as base64-encoded JSON — fetchable by text-only tools.
-
-    Usage: /b64/flask  or  /b64/flask?version=3.1.2
-    Response: {"ok": true, "package": "...", "version": "...",
-               "filename": "...", "size_bytes": N, "b64": "<base64>"}
-    """
-    if not _valid_pkg(pkg):
-        abort(400)
-    version = request.args.get("version", "").strip()
-    url = PYPI_JSON.format(pkg=pkg)
-    try:
-        r = requests.get(url, timeout=30)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"PyPI unreachable: {type(e).__name__}"}), 502
-    if r.status_code == 404:
-        return jsonify({"ok": False, "error": f"Package '{pkg}' not found on PyPI"}), 404
-    if r.status_code != 200:
-        return jsonify({"ok": False, "error": f"PyPI returned HTTP {r.status_code}"}), 502
-    data = r.json()
-    releases = data.get("releases", {})
-
-    if version:
-        if version not in releases:
-            return jsonify({"ok": False, "error": f"Version {version} not found for {pkg}"}), 404
-        candidates = releases[version]
-    else:
-        candidates = data.get("urls", [])
-        if not candidates:
-            if not releases:
-                return jsonify({"ok": False, "error": "No releases found"}), 404
-            top_ver = sorted(releases.keys())[-1]
-            candidates = releases[top_ver]
-
-    wheel = None
-    for f in candidates:
-        if f["filename"].endswith(".whl"):
-            wheel = f
-            break
-    if not wheel:
-        return jsonify({"ok": False, "error": "No .whl file found for this package"}), 404
-
-    try:
-        wr = requests.get(wheel["url"], timeout=60)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Wheel download failed: {type(e).__name__}"}), 502
-    if wr.status_code != 200:
-        return jsonify({"ok": False, "error": f"Wheel fetch returned HTTP {wr.status_code}"}), 502
-
-    content = wr.content
-    # Cap at 20 MB to keep JSON responses manageable
-    if len(content) > 20 * 1024 * 1024:
-        return jsonify({"ok": False, "error": "Wheel exceeds 20 MB cap"}), 413
-
-    b64 = base64.b64encode(content).decode("ascii")
-    return jsonify({
-        "ok": True,
-        "package": pkg,
-        "version": wheel.get("version", "?"),
-        "filename": wheel["filename"],
-        "size_bytes": len(content),
-        "b64": b64,
-    })
 
 
 # ---------------------------------------------------------------------------
