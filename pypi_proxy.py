@@ -7,9 +7,13 @@ the TradGPT pod has no outbound internet; Render does.
 
 Endpoints (all under /<PREFIX>/):
   /                     dashboard: list available packages
+  /health               liveness check (JSON)
   /download/<package>   download a wheel (.whl) for the given package name
                         ?version=X to pin a version (default: latest)
   /list/<package>       list available versions + wheel URLs (JSON)
+  /b64/<package>        fetch a wheel and return it as base64 in a JSON body
+                        (?version=X to pin). Use this when the client can only
+                        read text, not binary.
 
 Security:
   - Random 6-char path prefix per deploy (set PREFIX env var to override)
@@ -19,6 +23,7 @@ Security:
   - No credentials, no secrets, no mutation routes
 """
 
+import base64
 import os
 import re
 import secrets
@@ -80,14 +85,29 @@ def dashboard():
         "<p>Download Python wheels from PyPI via this bridge.</p>"
         "<p><b>Usage:</b></p>"
         "<ul>"
+        f"<li><a href='{BASE}/health'>/health</a> — liveness check (JSON)</li>"
         f"<li><a href='{BASE}/list/flask'>/list/&lt;package&gt;</a> — list versions</li>"
         f"<li><a href='{BASE}/download/flask'>/download/&lt;package&gt;</a> — download latest wheel</li>"
         f"<li><a href='{BASE}/download/flask?version=3.1.2'>/download/&lt;package&gt;?version=X</a> — pinned</li>"
+        f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (text-safe)</li>"
         "</ul>"
         "<p>Only .whl files are served. Package names must match "
         "[A-Za-z0-9._-]+ (max 100 chars).</p>"
     )
     return Response(body, mimetype="text/html")
+
+
+@app.route(f"{BASE}/health")
+def health():
+    return Response(
+        json.dumps({
+            "ok": True,
+            "service": "pypi-proxy",
+            "prefix": BASE + "/",
+            "endpoints": ["/", "/health", "/list/<pkg>", "/download/<pkg>", "/b64/<pkg>"],
+        }),
+        mimetype="application/json",
+    )
 
 
 @app.route(f"{BASE}/list/<path:pkg>")
@@ -126,27 +146,27 @@ def list_versions(pkg: str):
     return Response(body, mimetype="text/html")
 
 
-@app.route(f"{BASE}/download/<path:pkg>")
-def download_wheel(pkg: str):
-    if not _valid_pkg(pkg):
-        abort(400)
-    version = request.args.get("version", "").strip()
+def _pick_wheel(pkg: str, version: str):
+    """Fetch PyPI metadata and pick the target wheel.
+
+    Returns (wheel_dict, None) on success or (None, error_Response) on failure.
+    """
     url = PYPI_JSON.format(pkg=pkg)
     try:
         r = requests.get(url, timeout=30)
     except Exception as e:
-        return _err(f"PyPI unreachable: {type(e).__name__}: {e}")
+        return None, _err(f"PyPI unreachable: {type(e).__name__}: {e}")
     if r.status_code == 404:
-        return _err(f"Package '{pkg}' not found on PyPI", 404)
+        return None, _err(f"Package '{pkg}' not found on PyPI", 404)
     if r.status_code != 200:
-        return _err(f"PyPI returned HTTP {r.status_code}: {r.text[:500]}")
+        return None, _err(f"PyPI returned HTTP {r.status_code}: {r.text[:500]}")
     data = r.json()
     releases = data.get("releases", {})
 
     # Pick the target version
     if version:
         if version not in releases:
-            return _err(f"Version {version} not found for {pkg}", 404)
+            return None, _err(f"Version {version} not found for {pkg}", 404)
         candidates = releases[version]
     else:
         # Use the 'urls' field which points to the latest release
@@ -154,22 +174,29 @@ def download_wheel(pkg: str):
         if not candidates:
             # Fall back to highest version key
             if not releases:
-                return _err(f"No releases found for {pkg}", 404)
+                return None, _err(f"No releases found for {pkg}", 404)
             top_ver = sorted(releases.keys())[-1]
             candidates = releases[top_ver]
 
     # Find a wheel among the candidates
-    wheel = None
     for f in candidates:
         if f["filename"].endswith(".whl"):
-            wheel = f
-            break
-    if not wheel:
-        return _err(
-            f"No .whl file found for {pkg} "
-            f"(versions checked: {[f['filename'] for f in candidates[:5]]}). "
-            "This package may only ship source distributions."
-        )
+            return f, None
+    return None, _err(
+        f"No .whl file found for {pkg} "
+        f"(versions checked: {[f['filename'] for f in candidates[:5]]}). "
+        "This package may only ship source distributions."
+    )
+
+
+@app.route(f"{BASE}/download/<path:pkg>")
+def download_wheel(pkg: str):
+    if not _valid_pkg(pkg):
+        abort(400)
+    version = request.args.get("version", "").strip()
+    wheel, err = _pick_wheel(pkg, version)
+    if err is not None:
+        return err
 
     # Download the wheel binary
     try:
@@ -190,6 +217,46 @@ def download_wheel(pkg: str):
             "X-Package": pkg,
             "X-Version": wheel.get("version", "?"),
         },
+    )
+
+
+B64_MAX_BYTES = 20 * 1024 * 1024  # 20 MB cap per wheel for the text endpoint
+
+
+@app.route(f"{BASE}/b64/<path:pkg>")
+def b64_wheel(pkg: str):
+    """Return the wheel as base64 inside a JSON body (text-safe transport)."""
+    if not _valid_pkg(pkg):
+        abort(400)
+    version = request.args.get("version", "").strip()
+    wheel, err = _pick_wheel(pkg, version)
+    if err is not None:
+        return err
+
+    try:
+        wr = requests.get(wheel["url"], timeout=60)
+    except Exception as e:
+        return _err(f"Wheel download failed: {type(e).__name__}: {e}")
+    if wr.status_code != 200:
+        return _err(f"Wheel fetch returned HTTP {wr.status_code}", 502)
+
+    content = wr.content
+    if len(content) > B64_MAX_BYTES:
+        return _err(
+            f"Wheel too large for /b64/ ({len(content)} bytes > "
+            f"{B64_MAX_BYTES} cap). Use /download/ instead.", 413
+        )
+
+    return Response(
+        json.dumps({
+            "ok": True,
+            "package": pkg,
+            "version": wheel.get("version", "?"),
+            "filename": wheel["filename"],
+            "size_bytes": len(content),
+            "b64": base64.b64encode(content).decode("ascii"),
+        }),
+        mimetype="application/json",
     )
 
 
