@@ -15,6 +15,12 @@ Endpoints (all under /<PREFIX>/):
                         (?version=X to pin). Use this when the client can only
                         read text, not binary.
 
+Caching:
+  Wheels are cached on local disk after first download (WHEEL_CACHE_DIR env
+  var, default ./wheel_cache). First request for a package is slow (PyPI
+  fetch); every later request serves from disk in milliseconds. On Render
+  free tier the disk is ephemeral — a redeploy clears the cache.
+
 Security:
   - Random 6-char path prefix per deploy (set PREFIX env var to override)
   - Package names validated against ^[A-Za-z0-9._-]+$ (no path traversal)
@@ -222,6 +228,33 @@ def download_wheel(pkg: str):
 
 B64_MAX_BYTES = 20 * 1024 * 1024  # 20 MB cap per wheel for the text endpoint
 
+WHEEL_CACHE_DIR = os.environ.get("WHEEL_CACHE_DIR", os.path.join(os.getcwd(), "wheel_cache"))
+os.makedirs(WHEEL_CACHE_DIR, exist_ok=True)
+
+
+def _fetch_wheel_bytes(wheel: dict):
+    """Download a wheel, using the local disk cache when possible.
+
+    Returns (content, from_cache).
+    """
+    filename = wheel["filename"]
+    cache_path = os.path.join(WHEEL_CACHE_DIR, filename)
+    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        with open(cache_path, "rb") as fh:
+            return fh.read(), True
+    wr = requests.get(wheel["url"], timeout=60)
+    if wr.status_code != 200:
+        raise IOError(f"Wheel fetch returned HTTP {wr.status_code}")
+    content = wr.content
+    tmp_path = cache_path + ".part"
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        pass  # cache is best-effort; serve the bytes anyway
+    return content, False
+
 
 @app.route(f"{BASE}/b64/<path:pkg>")
 def b64_wheel(pkg: str):
@@ -234,13 +267,10 @@ def b64_wheel(pkg: str):
         return err
 
     try:
-        wr = requests.get(wheel["url"], timeout=60)
+        content, from_cache = _fetch_wheel_bytes(wheel)
     except Exception as e:
         return _err(f"Wheel download failed: {type(e).__name__}: {e}")
-    if wr.status_code != 200:
-        return _err(f"Wheel fetch returned HTTP {wr.status_code}", 502)
 
-    content = wr.content
     if len(content) > B64_MAX_BYTES:
         return _err(
             f"Wheel too large for /b64/ ({len(content)} bytes > "
@@ -254,6 +284,7 @@ def b64_wheel(pkg: str):
             "version": wheel.get("version", "?"),
             "filename": wheel["filename"],
             "size_bytes": len(content),
+            "from_cache": from_cache,
             "b64": base64.b64encode(content).decode("ascii"),
         }),
         mimetype="application/json",
