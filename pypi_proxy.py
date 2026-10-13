@@ -287,7 +287,7 @@ def b64_wheel(pkg: str):
             "from_cache": from_cache,
             "b64": base64.b64encode(content).decode("ascii"),
         }),
-        mimetype="application/json",
+        mimetype="text/html",  # text/html so web_extract processes it; body is still JSON
     )
 
 
