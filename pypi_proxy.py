@@ -184,10 +184,24 @@ def _pick_wheel(pkg: str, version: str):
             top_ver = sorted(releases.keys())[-1]
             candidates = releases[top_ver]
 
-    # Find a wheel among the candidates
+    # Find a wheel among the candidates — prefer pure-Python (py3-none-any)
+    # so the wheel works on any platform. Fall back to any .whl if no
+    # pure-Python build exists.
+    pure = None
+    any_whl = None
     for f in candidates:
-        if f["filename"].endswith(".whl"):
-            return f, None
+        fn = f["filename"]
+        if not fn.endswith(".whl"):
+            continue
+        if "py3-none-any" in fn or "py2.py3-none-any" in fn:
+            if pure is None:
+                pure = f
+        elif any_whl is None:
+            any_whl = f
+    if pure is not None:
+        return pure, None
+    if any_whl is not None:
+        return any_whl, None
     return None, _err(
         f"No .whl file found for {pkg} "
         f"(versions checked: {[f['filename'] for f in candidates[:5]]}). "
