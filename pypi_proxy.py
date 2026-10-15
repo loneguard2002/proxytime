@@ -10,10 +10,13 @@ Endpoints (all under /<PREFIX>/):
   /health               liveness check (JSON)
   /download/<package>   download a wheel (.whl) for the given package name
                         ?version=X to pin a version (default: latest)
+                        ?python=3.12&platform=manylinux to match this pod
   /list/<package>       list available versions + wheel URLs (JSON)
+                        ?python=3.12&platform=manylinux to filter wheels
+                        ?latest=true to only show the newest matching release
   /b64/<package>        fetch a wheel and return it as base64 in a JSON body
-                        (?version=X to pin). Use this when the client can only
-                        read text, not binary.
+                        (?version=X, ?python=X, ?platform=X). Use this when
+                        the client can only read text, not binary.
 
 Caching:
   Wheels are cached on local disk after first download (WHEEL_CACHE_DIR env
@@ -80,6 +83,49 @@ def _err(msg: str, code: int = 502) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Wheel tag helpers
+# ---------------------------------------------------------------------------
+
+def _wheel_tags(filename: str):
+    """Parse a .whl filename into (pytag, abitag, platform).
+
+    e.g. 'markupsafe-3.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl'
+      -> ('cp312', 'cp312', 'manylinux_2_17_x86_64.manylinux2014_x86_64')
+    Pure wheels: py3-none-any -> ('py3', 'none', 'any')
+    """
+    stem = filename[:-4]  # strip .whl
+    parts = stem.split("-")
+    if len(parts) < 5:
+        return None
+    return parts[-3], parts[-2], parts[-1]
+
+
+def _wheel_matches(wheel_file: dict, python: str = "", platform: str = "") -> bool:
+    """Check if a wheel file matches the given python/platform filters."""
+    fn = wheel_file["filename"]
+    tags = _wheel_tags(fn)
+    if tags is None:
+        return False
+    pytag, abitag, plat = tags
+
+    # Python filter: "3.12" matches cp312 or py3 (pure)
+    if python:
+        py_norm = python.replace(".", "")  # "3.12" -> "312"
+        if not (pytag == f"cp{py_norm}" or pytag.startswith("py")):
+            return False
+
+    # Platform filter: "manylinux" matches manylinux*, "musllinux" matches musllinux*,
+    # "win" matches win_amd64 etc., "macosx" matches macosx*, "any" always matches
+    if platform:
+        p = platform.lower()
+        if p != "any":
+            if not (plat == "any" or p in plat):
+                return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -93,8 +139,11 @@ def dashboard():
         "<ul>"
         f"<li><a href='{BASE}/health'>/health</a> — liveness check (JSON)</li>"
         f"<li><a href='{BASE}/list/flask'>/list/&lt;package&gt;</a> — list versions (JSON)</li>"
+        f"<li><a href='{BASE}/list/flask?python=3.12&platform=manylinux'>/list/&lt;package&gt;?python=X&amp;platform=Y</a> — filtered</li>"
+        f"<li><a href='{BASE}/list/flask?latest=true'>/list/&lt;package&gt;?latest=true</a> — newest only</li>"
         f"<li><a href='{BASE}/download/flask'>/download/&lt;package&gt;</a> — download latest wheel</li>"
         f"<li><a href='{BASE}/download/flask?version=3.1.2'>/download/&lt;package&gt;?version=X</a> — pinned</li>"
+        f"<li><a href='{BASE}/download/flask?python=3.12&platform=manylinux'>/download/&lt;package&gt;?python=X&amp;platform=Y</a> — platform-matched</li>"
         f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (text-safe)</li>"
         "</ul>"
         "<p>Only .whl files are served. Package names must match "
@@ -120,6 +169,9 @@ def health():
 def list_versions(pkg: str):
     if not _valid_pkg(pkg):
         abort(400)
+    python = request.args.get("python", "").strip()       # e.g. "3.12"
+    platform = request.args.get("platform", "").strip()   # e.g. "manylinux", "win", "macosx"
+    latest_only = request.args.get("latest", "").lower() in ("1", "true", "yes")
     url = PYPI_JSON.format(pkg=pkg)
     try:
         r = requests.get(url, timeout=30)
@@ -136,25 +188,33 @@ def list_versions(pkg: str):
     for ver, files in sorted(releases.items()):
         for f in files:
             if f["filename"].endswith(".whl"):
+                if python or platform:
+                    if not _wheel_matches(f, python, platform):
+                        continue
                 wheels.append({
                     "version": ver,
                     "filename": f["filename"],
                     "url": f["url"],
                     "python": f.get("requires_python"),
                 })
+    # If latest=true, only keep wheels from the highest version present
+    if latest_only and wheels:
+        top_ver = max(w["version"] for w in wheels)
+        wheels = [w for w in wheels if w["version"] == top_ver]
     return Response(
         json.dumps({
             "name": data.get("name", pkg),
             "summary": data.get("summary", ""),
             "release_count": len(releases),
             "wheel_count": len(wheels),
+            "filters": {"python": python or None, "platform": platform or None, "latest": latest_only},
             "wheels": wheels[:50],
         }),
         mimetype="application/json",
     )
 
 
-def _pick_wheel(pkg: str, version: str):
+def _pick_wheel(pkg: str, version: str, python: str = "", platform: str = ""):
     """Fetch PyPI metadata and pick the target wheel.
 
     Returns (wheel_dict, None) on success or (None, error_Response) on failure.
@@ -187,14 +247,32 @@ def _pick_wheel(pkg: str, version: str):
             candidates = releases[top_ver]
 
     # Find a wheel among the candidates — prefer pure-Python (py3-none-any)
-    # so the wheel works on any platform. Fall back to any .whl if no
-    # pure-Python build exists.
-    pure = None
-    any_whl = None
+    # so the wheel works on any platform. If python/platform filters are given,
+    # match those first; otherwise fall back to pure-Python, then any .whl.
+    filtered = []
     for f in candidates:
         fn = f["filename"]
         if not fn.endswith(".whl"):
             continue
+        if python or platform:
+            if _wheel_matches(f, python, platform):
+                filtered.append(f)
+        else:
+            filtered.append(f)
+
+    if not filtered:
+        return None, _err(
+            f"No .whl file found for {pkg} matching "
+            f"python={python or 'any'} platform={platform or 'any'} "
+            f"(candidates: {[f['filename'] for f in candidates[:5]]}). "
+            "This package may only ship source distributions."
+        )
+
+    # Prefer pure-Python wheels (work everywhere), then cp-specific, then any
+    pure = None
+    any_whl = None
+    for f in filtered:
+        fn = f["filename"]
         if "py3-none-any" in fn or "py2.py3-none-any" in fn:
             if pure is None:
                 pure = f
@@ -204,11 +282,7 @@ def _pick_wheel(pkg: str, version: str):
         return pure, None
     if any_whl is not None:
         return any_whl, None
-    return None, _err(
-        f"No .whl file found for {pkg} "
-        f"(versions checked: {[f['filename'] for f in candidates[:5]]}). "
-        "This package may only ship source distributions."
-    )
+    return filtered[0], None
 
 
 @app.route(f"{BASE}/download/<path:pkg>")
@@ -216,7 +290,9 @@ def download_wheel(pkg: str):
     if not _valid_pkg(pkg):
         abort(400)
     version = request.args.get("version", "").strip()
-    wheel, err = _pick_wheel(pkg, version)
+    python = request.args.get("python", "").strip()
+    platform = request.args.get("platform", "").strip()
+    wheel, err = _pick_wheel(pkg, version, python, platform)
     if err is not None:
         return err
 
@@ -278,7 +354,9 @@ def b64_wheel(pkg: str):
     if not _valid_pkg(pkg):
         abort(400)
     version = request.args.get("version", "").strip()
-    wheel, err = _pick_wheel(pkg, version)
+    python = request.args.get("python", "").strip()
+    platform = request.args.get("platform", "").strip()
+    wheel, err = _pick_wheel(pkg, version, python, platform)
     if err is not None:
         return err
 
