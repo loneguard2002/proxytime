@@ -92,7 +92,7 @@ def dashboard():
         "<p><b>Usage:</b></p>"
         "<ul>"
         f"<li><a href='{BASE}/health'>/health</a> — liveness check (JSON)</li>"
-        f"<li><a href='{BASE}/list/flask'>/list/&lt;package&gt;</a> — list versions</li>"
+        f"<li><a href='{BASE}/list/flask'>/list/&lt;package&gt;</a> — list versions (JSON)</li>"
         f"<li><a href='{BASE}/download/flask'>/download/&lt;package&gt;</a> — download latest wheel</li>"
         f"<li><a href='{BASE}/download/flask?version=3.1.2'>/download/&lt;package&gt;?version=X</a> — pinned</li>"
         f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (text-safe)</li>"
@@ -142,14 +142,16 @@ def list_versions(pkg: str):
                     "url": f["url"],
                     "python": f.get("requires_python"),
                 })
-    body = (
-        f"<h1>{data.get('name', pkg)} — available wheels</h1>"
-        f"<p>Summary: {data.get('summary', '')}</p>"
-        f"<p>{len(wheels)} wheel(s) across {len(releases)} release(s)</p>"
-        f"<pre>{json.dumps(wheels[:50], indent=2)}</pre>"
-        f"<p><a href='{BASE}/'>back</a></p>"
+    return Response(
+        json.dumps({
+            "name": data.get("name", pkg),
+            "summary": data.get("summary", ""),
+            "release_count": len(releases),
+            "wheel_count": len(wheels),
+            "wheels": wheels[:50],
+        }),
+        mimetype="application/json",
     )
-    return Response(body, mimetype="text/html")
 
 
 def _pick_wheel(pkg: str, version: str):
