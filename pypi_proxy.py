@@ -36,6 +36,7 @@ import base64
 import os
 import re
 import secrets
+import textwrap
 import time
 import json
 from collections import defaultdict
@@ -376,6 +377,7 @@ def b64_wheel(pkg: str):
         )
 
     b64_str = base64.b64encode(content).decode("ascii")
+    b64_wrapped = "\n".join(textwrap.wrap(b64_str, 76)) if b64_str else ""
     payload = {
         "ok": True,
         "package": pkg,
@@ -383,6 +385,7 @@ def b64_wheel(pkg: str):
         "filename": wheel["filename"],
         "size_bytes": len(content),
         "from_cache": from_cache,
+        "b64_lines": b64_wrapped.split("\n") if b64_wrapped else [],
         "b64": b64_str,
     }
     body = (
@@ -458,6 +461,10 @@ def chunk_wheel(pkg: str):
     end = min(offset + size, total_b64)
     chunk = full_b64[offset:end]
 
+    # Wrap the chunk in 76-char lines so text-extractors don't choke on
+    # one giant unbroken token. Client strips whitespace before decoding.
+    chunk_wrapped = "\n".join(textwrap.wrap(chunk, 76)) if chunk else ""
+
     # Wrap in minimal HTML so text-extractors (Perplexity/Firecrawl) treat
     # it as a normal page rather than rejecting raw/base64-looking bodies.
     payload = {
@@ -471,6 +478,7 @@ def chunk_wheel(pkg: str):
         "offset": offset,
         "chunk_size": end - offset,
         "remaining": total_b64 - end,
+        "b64_lines": chunk_wrapped.split("\n") if chunk_wrapped else [],
         "b64": chunk,
     }
     body = (
