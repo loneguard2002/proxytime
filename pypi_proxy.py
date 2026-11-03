@@ -373,18 +373,22 @@ def b64_wheel(pkg: str):
             f"{B64_MAX_BYTES} cap). Use /download/ instead.", 413
         )
 
-    return Response(
-        json.dumps({
-            "ok": True,
-            "package": pkg,
-            "version": wheel.get("version", "?"),
-            "filename": wheel["filename"],
-            "size_bytes": len(content),
-            "from_cache": from_cache,
-            "b64": base64.b64encode(content).decode("ascii"),
-        }),
-        mimetype="text/html",  # text/html so web_extract processes it; body is still JSON
+    b64_str = base64.b64encode(content).decode("ascii")
+    payload = {
+        "ok": True,
+        "package": pkg,
+        "version": wheel.get("version", "?"),
+        "filename": wheel["filename"],
+        "size_bytes": len(content),
+        "from_cache": from_cache,
+        "b64": b64_str,
+    }
+    body = (
+        "<!DOCTYPE html><html><head><title>"
+        + pkg + " b64</title></head><body>"
+        + "<pre>" + json.dumps(payload, indent=2) + "</pre></body></html>"
     )
+    return Response(body, mimetype="text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -452,22 +456,27 @@ def chunk_wheel(pkg: str):
     end = min(offset + size, total_b64)
     chunk = full_b64[offset:end]
 
-    return Response(
-        json.dumps({
-            "ok": True,
-            "package": pkg,
-            "version": wheel.get("version", "?"),
-            "filename": wheel["filename"],
-            "size_bytes": len(content),
-            "from_cache": from_cache,
-            "total_b64_len": total_b64,
-            "offset": offset,
-            "chunk_size": end - offset,
-            "remaining": total_b64 - end,
-            "b64": chunk,
-        }),
-        mimetype="text/html",
+    # Wrap in minimal HTML so text-extractors (Perplexity/Firecrawl) treat
+    # it as a normal page rather than rejecting raw/base64-looking bodies.
+    payload = {
+        "ok": True,
+        "package": pkg,
+        "version": wheel.get("version", "?"),
+        "filename": wheel["filename"],
+        "size_bytes": len(content),
+        "from_cache": from_cache,
+        "total_b64_len": total_b64,
+        "offset": offset,
+        "chunk_size": end - offset,
+        "remaining": total_b64 - end,
+        "b64": chunk,
+    }
+    body = (
+        "<!DOCTYPE html><html><head><title>"
+        + pkg + " chunk " + str(offset) + "</title></head><body>"
+        + "<pre>" + json.dumps(payload, indent=2) + "</pre></body></html>"
     )
+    return Response(body, mimetype="text/html")
 
 
 # ---------------------------------------------------------------------------
