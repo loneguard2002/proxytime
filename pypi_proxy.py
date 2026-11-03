@@ -145,6 +145,8 @@ def dashboard():
         f"<li><a href='{BASE}/download/flask?version=3.1.2'>/download/&lt;package&gt;?version=X</a> — pinned</li>"
         f"<li><a href='{BASE}/download/flask?python=3.12&platform=manylinux'>/download/&lt;package&gt;?python=X&amp;platform=Y</a> — platform-matched</li>"
         f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (text-safe)</li>"
+        f"<li><a href='{BASE}/chunk/flask'>/chunk/&lt;package&gt;</a> — wheel in 8KB base64 slices</li>"
+        f"<li><a href='{BASE}/chunk/flask?offset=8192'>/chunk/&lt;package&gt;?offset=N</a> — next slice</li>"
         "</ul>"
         "<p>Only .whl files are served. Package names must match "
         "[A-Za-z0-9._-]+ (max 100 chars).</p>"
@@ -159,7 +161,7 @@ def health():
             "ok": True,
             "service": "pypi-proxy",
             "prefix": BASE + "/",
-            "endpoints": ["/", "/health", "/list/<pkg>", "/download/<pkg>", "/b64/<pkg>"],
+            "endpoints": ["/", "/health", "/list/<pkg>", "/download/<pkg>", "/b64/<pkg>", "/chunk/<pkg>"],
         }),
         mimetype="application/json",
     )
@@ -382,6 +384,89 @@ def b64_wheel(pkg: str):
             "b64": base64.b64encode(content).decode("ascii"),
         }),
         mimetype="text/html",  # text/html so web_extract processes it; body is still JSON
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunked transfer — pull a wheel in small text-safe slices
+# ---------------------------------------------------------------------------
+
+CHUNK_DEFAULT = 8 * 1024   # 8 KB of raw bytes per chunk (~11 KB base64)
+CHUNK_MAX = 32 * 1024      # cap at 32 KB raw per request
+
+
+@app.route(f"{BASE}/chunk/<path:pkg>")
+def chunk_wheel(pkg: str):
+    """Return a slice of the wheel as base64, for text-only fetchers.
+
+    Usage:
+        /chunk/flask                        → metadata + first chunk
+        /chunk/flask?offset=8192            → next chunk
+        /chunk/flask?python=3.12&platform=manylinux&offset=0
+
+    Response JSON:
+        {ok, package, version, filename, size_bytes,
+         total_b64_len, offset, chunk_size, remaining, b64}
+
+    Client loops: offset += chunk_size until remaining == 0,
+    concatenates all b64 strings, decodes → wheel file.
+    """
+    if not _valid_pkg(pkg):
+        abort(400)
+    version = request.args.get("version", "").strip()
+    python = request.args.get("python", "").strip()
+    platform = request.args.get("platform", "").strip()
+    wheel, err = _pick_wheel(pkg, version, python, platform)
+    if err is not None:
+        return err
+
+    try:
+        content, from_cache = _fetch_wheel_bytes(wheel)
+    except Exception as e:
+        return _err(f"Wheel download failed: {type(e).__name__}: {e}")
+
+    if len(content) > B64_MAX_BYTES:
+        return _err(
+            f"Wheel too large ({len(content)} bytes > "
+            f"{B64_MAX_BYTES} cap). Use /download/ instead.", 413
+        )
+
+    full_b64 = base64.b64encode(content).decode("ascii")
+    total_b64 = len(full_b64)
+
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        return _err("offset must be an integer", 400)
+    if offset < 0 or offset >= total_b64:
+        return _err(f"offset out of range (0..{total_b64 - 1})", 400)
+
+    try:
+        size = int(request.args.get("size", str(CHUNK_DEFAULT)))
+    except ValueError:
+        return _err("size must be an integer", 400)
+    size = max(512, min(size, CHUNK_MAX))
+
+    # Slice the base64 string directly (safe: base64 has no structure
+    # that breaks on arbitrary cuts as long as we reassemble before decode)
+    end = min(offset + size, total_b64)
+    chunk = full_b64[offset:end]
+
+    return Response(
+        json.dumps({
+            "ok": True,
+            "package": pkg,
+            "version": wheel.get("version", "?"),
+            "filename": wheel["filename"],
+            "size_bytes": len(content),
+            "from_cache": from_cache,
+            "total_b64_len": total_b64,
+            "offset": offset,
+            "chunk_size": end - offset,
+            "remaining": total_b64 - end,
+            "b64": chunk,
+        }),
+        mimetype="text/html",
     )
 
 
