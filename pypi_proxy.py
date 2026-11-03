@@ -147,6 +147,8 @@ def dashboard():
         f"<li><a href='{BASE}/b64/flask'>/b64/&lt;package&gt;</a> — wheel as base64 JSON (text-safe)</li>"
         f"<li><a href='{BASE}/chunk/flask'>/chunk/&lt;package&gt;</a> — wheel in 8KB base64 slices</li>"
         f"<li><a href='{BASE}/chunk/flask?offset=8192'>/chunk/&lt;package&gt;?offset=N</a> — next slice</li>"
+        f"<li><a href='{BASE}/warm/flask'>/warm/&lt;package&gt;</a> — pre-fetch to local disk cache</li>"
+        f"<li><a href='{BASE}/status/flask'>/status/&lt;package&gt;</a> — is it cached? (instant)</li>"
         "</ul>"
         "<p>Only .whl files are served. Package names must match "
         "[A-Za-z0-9._-]+ (max 100 chars).</p>"
@@ -161,7 +163,7 @@ def health():
             "ok": True,
             "service": "pypi-proxy",
             "prefix": BASE + "/",
-            "endpoints": ["/", "/health", "/list/<pkg>", "/download/<pkg>", "/b64/<pkg>", "/chunk/<pkg>"],
+            "endpoints": ["/", "/health", "/list/<pkg>", "/download/<pkg>", "/b64/<pkg>", "/chunk/<pkg>", "/warm/<pkg>", "/status/<pkg>"],
         }),
         mimetype="application/json",
     )
@@ -474,6 +476,84 @@ def chunk_wheel(pkg: str):
     body = (
         "<!DOCTYPE html><html><head><title>"
         + pkg + " chunk " + str(offset) + "</title></head><body>"
+        + "<pre>" + json.dumps(payload, indent=2) + "</pre></body></html>"
+    )
+    return Response(body, mimetype="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Warm / status — pre-fetch a wheel to local disk, then verify before chunking
+# ---------------------------------------------------------------------------
+
+@app.route(f"{BASE}/warm/<path:pkg>")
+def warm_wheel(pkg: str):
+    """Download the wheel to local disk cache. Returns fast confirmation.
+
+    Call this FIRST (it can take 10-30s on a cold start). Then check /status/
+    and pull /chunk/ slices which will be instant cache hits.
+    """
+    if not _valid_pkg(pkg):
+        abort(400)
+    version = request.args.get("version", "").strip()
+    python = request.args.get("python", "").strip()
+    platform = request.args.get("platform", "").strip()
+    wheel, err = _pick_wheel(pkg, version, python, platform)
+    if err is not None:
+        return err
+
+    try:
+        content, from_cache = _fetch_wheel_bytes(wheel)
+    except Exception as e:
+        return _err(f"Wheel download failed: {type(e).__name__}: {e}")
+
+    payload = {
+        "ok": True,
+        "package": pkg,
+        "version": wheel.get("version", "?"),
+        "filename": wheel["filename"],
+        "size_bytes": len(content),
+        "from_cache": from_cache,
+        "message": "cached locally, ready for /chunk/" if not from_cache else "already cached",
+    }
+    body = (
+        "<!DOCTYPE html><html><head><title>"
+        + pkg + " warm</title></head><body>"
+        + "<pre>" + json.dumps(payload, indent=2) + "</pre></body></html>"
+    )
+    return Response(body, mimetype="text/html")
+
+
+@app.route(f"{BASE}/status/<path:pkg>")
+def status_wheel(pkg: str):
+    """Check if a wheel is in the local disk cache (instant, no PyPI call).
+
+    Returns: {ok, package, filename, size_bytes, cached: true/false}
+    """
+    if not _valid_pkg(pkg):
+        abort(400)
+    version = request.args.get("version", "").strip()
+    python = request.args.get("python", "").strip()
+    platform = request.args.get("platform", "").strip()
+    wheel, err = _pick_wheel(pkg, version, python, platform)
+    if err is not None:
+        return err
+
+    filename = wheel["filename"]
+    cache_path = os.path.join(WHEEL_CACHE_DIR, filename)
+    cached = os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0
+    size = os.path.getsize(cache_path) if cached else 0
+
+    payload = {
+        "ok": True,
+        "package": pkg,
+        "version": wheel.get("version", "?"),
+        "filename": filename,
+        "cached": cached,
+        "size_bytes": size,
+    }
+    body = (
+        "<!DOCTYPE html><html><head><title>"
+        + pkg + " status</title></head><body>"
         + "<pre>" + json.dumps(payload, indent=2) + "</pre></body></html>"
     )
     return Response(body, mimetype="text/html")
